@@ -354,6 +354,11 @@ def fused_recurrent_kda(
     lower_bound: float | None = None,
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    inplace_final_state: bool = False,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    vfirst_state_pool: bool = False,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
@@ -442,6 +447,58 @@ def fused_recurrent_kda(
             cu_seqlens=cu_seqlens
         )
     """
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad
+        for tensor in (q, k, v, g, beta, A_log, dt_bias, initial_state)
+    )
+    deterministic_path = (
+        needs_backward
+        or vfirst_state_pool
+        or inplace_final_state
+        or ssm_state_indices is not None
+        or num_accepted_tokens is not None
+        or out is not None
+        or 'transpose_state_layout' in kwargs
+    )
+    if deterministic_path:
+        from fla.ops.kda.deterministic_recurrent import deterministic_fused_recurrent_kda
+
+        transpose_state_layout = state_v_first
+        if 'transpose_state_layout' in kwargs:
+            if state_v_first:
+                raise ValueError('Cannot pass both `state_v_first` and `transpose_state_layout`.')
+            warnings.warn(
+                '`transpose_state_layout` is deprecated and renamed to `state_v_first`.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            transpose_state_layout = kwargs.pop('transpose_state_layout')
+        return deterministic_fused_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            inplace_final_state=inplace_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=allow_neg_eigval,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            out=out,
+            transpose_state_layout=transpose_state_layout,
+            vfirst_state_pool=vfirst_state_pool,
+            **kwargs,
+        )
+
     if 'transpose_state_layout' in kwargs:
         if state_v_first:
             raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")

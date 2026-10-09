@@ -6,9 +6,13 @@
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 from .chunk import chunk_kda
+from .contract import prepare_fused_recurrent_kda_gate_beta
+from .deterministic_recurrent import deterministic_fused_recurrent_kda
 from .fused_recurrent import fused_recurrent_kda
 
 __all__ = [
     "chunk_kda",
+    "deterministic_fused_recurrent_kda",
     "fused_recurrent_kda",
+    "prepare_fused_recurrent_kda_gate_beta",
 ]

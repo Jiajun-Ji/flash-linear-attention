@@ -1,0 +1,762 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
+# This kernel is modified from the Decode kernel of the vllm gdn/kda model.
+
+import torch
+import triton
+import triton.language as tl
+
+from fla.ops.kda.deterministic_recurrent_bwd import fused_recurrent_kda_bwd
+from fla.ops.utils.op import exp
+from fla.ops.utils.softplus import softplus
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+
+
+@triton.heuristics(
+    {
+        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
+        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
+        "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "HAS_DT_BIAS": lambda args: args["dt_bias"] is not None,
+        "USE_LOWER_BOUND": lambda args: args["lower_bound"] is not None,
+        "SAVE_RESIDUAL": lambda args: args["residual"] is not None,
+    }
+)
+@triton.jit(
+    do_not_specialize=["N", "T", "VFIRST_STATE_POOL", "NUM_STATE_SLOTS"]
+)
+def fused_recurrent_kda_fwd_kernel(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    o,
+    residual,
+    h0,
+    ht,
+    cu_seqlens,
+    ssm_state_indices,
+    num_accepted_tokens,
+    lower_bound,
+    scale: tl.constexpr,
+    N: tl.int64,  # num of sequences
+    T: tl.int64,  # num of tokens
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    stride_init_state_token: tl.constexpr,
+    stride_final_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
+    stride_indices_tok: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
+    INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
+    IS_BETA_HEADWISE: tl.constexpr,  # whether beta is headwise vector or scalar,
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    IS_CONTINUOUS_BATCHING: tl.constexpr,
+    IS_SPEC_DECODING: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    USE_GATE_IN_KERNEL: tl.constexpr,
+    USE_LOWER_BOUND: tl.constexpr,
+    SAVE_RESIDUAL: tl.constexpr,
+    APPLY_BETA_SIGMOID: tl.constexpr,
+    ALLOW_NEG_EIGVAL: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
+    VFIRST_STATE_POOL,
+    NUM_STATE_SLOTS: tl.int64,
+    num_stages: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    NV = tl.cdiv(V, BV)
+    NK = tl.cdiv(K, BK)
+    i_k = pid % NK
+    pid_rest = pid // NK
+
+    i_v = pid_rest % NV
+    i_nh = pid_rest // NV
+    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_h = i_hv // (HV // H)
+    if IS_VARLEN:
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int64),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int64),
+        )
+        T = eos - bos
+    else:
+        bos, eos = i_n * T, i_n * T + T
+
+    o_k = i_k * BK + tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    p_q = q + (bos * H + i_h) * K + o_k
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
+    if IS_BETA_HEADWISE:
+        p_beta = beta + (bos * HV + i_hv) * V + o_v
+    else:
+        p_beta = beta + bos * HV + i_hv
+
+    p_g = g + (bos * HV + i_hv) * K + o_k
+    p_o = o + (bos * HV + i_hv) * V + o_v
+    if SAVE_RESIDUAL:
+        p_residual = residual + (bos * HV + i_hv) * V + o_v
+
+    mask_k = o_k < K
+    mask_v = o_v < V
+    if TRANSPOSE_STATE:
+        mask_h = mask_v[:, None] & mask_k[None, :]
+    else:
+        mask_h = mask_k[:, None] & mask_v[None, :]
+
+    if TRANSPOSE_STATE:
+        b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    else:
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        state_valid = True
+        if IS_CONTINUOUS_BATCHING:
+            if IS_SPEC_DECODING:
+                i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
+            else:
+                i_t = 0
+            state_index = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
+            valid_pool_index = (state_index >= 0) & (state_index < NUM_STATE_SLOTS)
+            state_valid = (VFIRST_STATE_POOL == 0) | valid_pool_index
+            state_index = tl.where(state_valid, state_index, 0)
+            p_h0 = (
+                h0
+                + state_index * stride_init_state_token
+            )
+            if TRANSPOSE_STATE:
+                p_h0 = p_h0 + i_hv * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                # Keep both address maps in the same non-specialized kernel.
+                # This preserves the canonical [BK, BV] distributed layout;
+                # specializing a V-first branch changes the reduction lowering.
+                canonical_offset = o_k[:, None] * V + o_v[None, :]
+                vfirst_offset = o_v[None, :] * K + o_k[:, None]
+                state_offset = tl.where(
+                    VFIRST_STATE_POOL != 0,
+                    vfirst_offset,
+                    canonical_offset,
+                )
+                p_h0 = p_h0 + i_hv * K * V + state_offset
+        else:
+            if TRANSPOSE_STATE:
+                p_h0 = h0 + (i_n * HV + i_hv) * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                canonical_offset = o_k[:, None] * V + o_v[None, :]
+                vfirst_offset = o_v[None, :] * K + o_k[:, None]
+                state_offset = tl.where(
+                    VFIRST_STATE_POOL != 0,
+                    vfirst_offset,
+                    canonical_offset,
+                )
+                p_h0 = h0 + (i_n * HV + i_hv) * K * V + state_offset
+        b_h += tl.load(p_h0, mask=mask_h & state_valid, other=0).to(tl.float32)
+
+    for i_t in tl.range(0, T, num_stages=num_stages):
+        b_q = tl.load(p_q, mask=mask_k, other=0, eviction_policy='evict_last').to(tl.float32)
+        b_k = tl.load(p_k, mask=mask_k, other=0, eviction_policy='evict_last').to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_v, other=0, eviction_policy='evict_first').to(tl.float32)
+
+        if USE_QK_L2NORM_IN_KERNEL:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+        b_q = b_q * scale
+        b_g = tl.load(p_g, mask=mask_k, other=0, eviction_policy='evict_last').to(tl.float32)
+
+        if USE_GATE_IN_KERNEL:
+            b_A = tl.load(A_log + i_h).to(tl.float32)
+
+            if HAS_DT_BIAS:
+                b_bias = tl.load(dt_bias + i_h * K + o_k, mask=mask_k, other=0).to(tl.float32)
+                b_g = b_g + b_bias
+
+            if USE_LOWER_BOUND:
+                b_gk = lower_bound * tl.sigmoid(exp(b_A) * b_g)
+            else:
+                b_gk = -exp(b_A) * softplus(b_g)
+        else:
+            b_gk = b_g
+
+        if TRANSPOSE_STATE:
+            b_h *= exp(b_gk[None, :])
+        else:
+            b_h *= exp(b_gk[:, None])
+
+        if TRANSPOSE_STATE:
+            b_v -= tl.sum(b_h * b_k[None, :], 1)
+        else:
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+        if SAVE_RESIDUAL:
+            tl.store(p_residual, b_v, mask=mask_v, eviction_policy='evict_first')
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0, eviction_policy='evict_first').to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta, eviction_policy='evict_last').to(tl.float32)
+        if APPLY_BETA_SIGMOID:
+            b_beta = tl.sigmoid(b_beta)
+            if ALLOW_NEG_EIGVAL:
+                b_beta *= 2.0
+        b_v *= b_beta
+        if TRANSPOSE_STATE:
+            b_h += b_v[:, None] * b_k[None, :]
+            b_o = tl.sum(b_h * b_q[None, :], 1)
+        else:
+            b_h += b_k[:, None] * b_v[None, :]
+            b_o = tl.sum(b_h * b_q[:, None], 0)
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v, eviction_policy='evict_first')
+
+        if IS_CONTINUOUS_BATCHING:
+            if INPLACE_FINAL_STATE:
+                state_index = tl.load(
+                    ssm_state_indices + i_n * stride_indices_seq + i_t
+                ).to(tl.int64)
+                valid_pool_index = (state_index >= 0) & (state_index < NUM_STATE_SLOTS)
+                state_valid = (VFIRST_STATE_POOL == 0) | valid_pool_index
+                state_index = tl.where(state_valid, state_index, 0)
+                p_ht = (
+                    ht
+                    + state_index * stride_final_state_token
+                )
+            else:
+                state_valid = True
+                p_ht = ht + (bos + i_t) * stride_final_state_token
+            if TRANSPOSE_STATE:
+                p_ht = p_ht + i_hv * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                canonical_offset = o_k[:, None] * V + o_v[None, :]
+                vfirst_offset = o_v[None, :] * K + o_k[:, None]
+                state_offset = tl.where(
+                    VFIRST_STATE_POOL != 0,
+                    vfirst_offset,
+                    canonical_offset,
+                )
+                p_ht = p_ht + i_hv * K * V + state_offset
+            tl.store(
+                p_ht,
+                b_h.to(p_ht.dtype.element_ty),
+                mask=mask_h & state_valid,
+            )
+
+        p_q += H * K
+        p_k += H * K
+        p_o += HV * V
+        p_v += HV * V
+        p_g += HV * K
+        p_beta += HV * (V if IS_BETA_HEADWISE else 1)
+        if SAVE_RESIDUAL:
+            p_residual += HV * V
+
+    if not IS_CONTINUOUS_BATCHING:
+        if STORE_FINAL_STATE:
+            if TRANSPOSE_STATE:
+                p_ht = ht + (i_n * HV + i_hv) * K * V + o_v[:, None] * K + o_k[None, :]
+            else:
+                canonical_offset = o_k[:, None] * V + o_v[None, :]
+                vfirst_offset = o_v[None, :] * K + o_k[:, None]
+                state_offset = tl.where(
+                    VFIRST_STATE_POOL != 0,
+                    vfirst_offset,
+                    canonical_offset,
+                )
+                p_ht = ht + (i_n * HV + i_hv) * K * V + state_offset
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+
+@torch.compiler.disable
+def fused_recurrent_kda_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    scale: float | None = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    lower_bound: float | None = None,
+    out: torch.Tensor | None = None,
+    transpose_state_layout: bool = False,
+    vfirst_state_pool: bool = False,
+    residual: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    B, T, H, K, V = *k.shape, v.shape[-1]
+    HV = v.shape[2]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    BK = triton.next_power_of_2(K)
+    BV = 32
+
+    if out is None:
+        out = torch.zeros_like(v)
+    else:
+        assert out.shape == v.shape
+    if residual is not None:
+        if residual.shape != v.shape:
+            raise ValueError(f"Expected `residual` to have shape {v.shape}, got {residual.shape}.")
+        if residual.dtype != torch.float32:
+            raise ValueError(f"Expected `residual` to use torch.float32, got {residual.dtype}.")
+    if inplace_final_state:
+        assert initial_state is not None
+        final_state = initial_state
+    elif output_final_state:
+        if transpose_state_layout or vfirst_state_pool:
+            final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
+        else:
+            final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
+    else:
+        final_state = None
+
+    stride_init_state_token = initial_state.stride(0) if initial_state is not None else 1
+    stride_final_state_token = final_state.stride(0) if final_state is not None else 1
+
+    if ssm_state_indices is None:
+        stride_indices_seq, stride_indices_tok = 1, 1
+    elif ssm_state_indices.ndim == 1:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
+    else:
+        stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
+
+    grid = (triton.cdiv(V, BV) * N * HV, )
+    fused_recurrent_kda_fwd_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        o=out,
+        residual=residual,
+        h0=initial_state,
+        ht=final_state,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        lower_bound=lower_bound,
+        scale=scale,
+        N=N,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        stride_init_state_token=stride_init_state_token,
+        stride_final_state_token=stride_final_state_token,
+        stride_indices_seq=stride_indices_seq,
+        stride_indices_tok=stride_indices_tok,
+        IS_BETA_HEADWISE=beta.ndim == v.ndim,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        INPLACE_FINAL_STATE=inplace_final_state,
+        USE_GATE_IN_KERNEL=use_gate_in_kernel,
+        APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
+        ALLOW_NEG_EIGVAL=allow_neg_eigval,
+        TRANSPOSE_STATE=transpose_state_layout,
+        VFIRST_STATE_POOL=vfirst_state_pool,
+        NUM_STATE_SLOTS=(initial_state.shape[0] if vfirst_state_pool else 0),
+        num_warps=4,
+        num_stages=2,
+    )
+
+    return out, final_state
+
+
+class FusedRecurrentKDAFunction(torch.autograd.Function):
+    @staticmethod
+    @autocast_custom_fwd
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor | None,
+        dt_bias: torch.Tensor | None,
+        scale: float,
+        initial_state: torch.Tensor | None,
+        output_final_state: bool,
+        use_qk_l2norm_in_kernel: bool,
+        use_gate_in_kernel: bool,
+        use_beta_sigmoid_in_kernel: bool,
+        allow_neg_eigval: bool,
+        lower_bound: float | None,
+        transpose_state_layout: bool,
+        cu_seqlens: torch.LongTensor | None,
+    ):
+        residual = torch.empty_like(v, dtype=torch.float32)
+        o, final_state = fused_recurrent_kda_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            inplace_final_state=False,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=allow_neg_eigval,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            transpose_state_layout=transpose_state_layout,
+            residual=residual,
+        )
+        ctx.save_for_backward(q, k, v, g, beta, A_log, dt_bias, initial_state, residual)
+        ctx.scale = scale
+        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        ctx.use_gate_in_kernel = use_gate_in_kernel
+        ctx.use_beta_sigmoid_in_kernel = use_beta_sigmoid_in_kernel
+        ctx.allow_neg_eigval = allow_neg_eigval
+        ctx.lower_bound = lower_bound
+        ctx.transpose_state_layout = transpose_state_layout
+        ctx.cu_seqlens = cu_seqlens
+        return o, final_state
+
+    @staticmethod
+    @input_guard
+    @autocast_custom_bwd
+    def backward(ctx, do: torch.Tensor | None, dht: torch.Tensor | None):
+        q, k, v, g, beta, A_log, dt_bias, initial_state, residual = ctx.saved_tensors
+        if do is None:
+            do = torch.zeros_like(v)
+
+        dq, dk, dv, dg, db, dA, ddt_bias, dh0 = fused_recurrent_kda_bwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            residual=residual,
+            do=do,
+            dht=dht,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=ctx.scale,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=ctx.use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=ctx.use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel=ctx.use_beta_sigmoid_in_kernel,
+            allow_neg_eigval=ctx.allow_neg_eigval,
+            lower_bound=ctx.lower_bound,
+            transpose_state_layout=ctx.transpose_state_layout,
+            cu_seqlens=ctx.cu_seqlens,
+        )
+        return (
+            dq.to(q),
+            dk.to(k),
+            dv.to(v),
+            dg.to(g),
+            db.to(beta),
+            dA.to(A_log) if dA is not None else None,
+            ddt_bias.to(dt_bias) if ddt_bias is not None else None,
+            None,
+            dh0.to(initial_state) if dh0 is not None else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+@input_guard
+def deterministic_fused_recurrent_kda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    scale: float | None = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    inplace_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
+    use_beta_sigmoid_in_kernel: bool = False,
+    allow_neg_eigval: bool = False,
+    lower_bound: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    transpose_state_layout: bool = False,
+    vfirst_state_pool: bool = False,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""
+    Args:
+        q (torch.Tensor):
+            queries of shape `[B, T, H, K]`.
+        k (torch.Tensor):
+            keys of shape `[B, T, H, K]`.
+        v (torch.Tensor):
+            values of shape `[B, T, HV, V]`.
+            GVA is applied if `HV > H`.
+        g (torch.Tensor):
+            g (decays) of shape `[B, T, HV, K]`.
+        beta (torch.Tensor):
+            betas of shape `[B, T, HV]` or per-value betas of shape `[B, T, HV, V]`.
+        scale (Optional[float]):
+            Scale factor for the RetNet attention scores.
+            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
+        initial_state (Optional[torch.Tensor]):
+            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
+            For equal-length input sequences, `N` equals the batch size `B`.
+            Default: `None`.
+        output_final_state (Optional[bool]):
+            Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
+        inplace_final_state (Optional[bool]):
+            Whether to update `initial_state` in place. This is intended for decode/state-cache
+            serving paths where the recurrent state already lives in a persistent cache.
+            Default: `False`.
+        use_qk_l2norm_in_kernel (Optional[bool]):
+            Whether to use L2 normalization in the kernel. Default: `False`.
+        use_beta_sigmoid_in_kernel (Optional[bool]):
+            Whether to apply sigmoid to raw beta logits in the kernel. Default: `False`.
+        allow_neg_eigval (Optional[bool]):
+            Whether raw beta uses ``2 * sigmoid(beta)``. This requires
+            ``use_beta_sigmoid_in_kernel=True``. Default: `False`.
+        cu_seqlens (torch.LongTensor):
+            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
+            consistent with the FlashAttention API.
+        ssm_state_indices (torch.Tensor):
+            Optional mapping from logical sequence index to physical recurrent-state cache slot.
+            Used by continuous batching decode paths.
+        num_accepted_tokens (torch.Tensor):
+            Optional accepted-token counts used with speculative decoding and a 2D
+            `ssm_state_indices` history.
+        out (Optional[torch.Tensor]):
+            Optional preallocated output tensor of shape `[B, T, HV, V]`.
+        transpose_state_layout (bool):
+            Whether to use transposed state layout `[V, K]` instead of `[K, V]`. Default: `False`.
+        vfirst_state_pool (bool):
+            Whether ``initial_state`` is a persistent ``[slot, HV, V, K]``
+            pool selected by ``ssm_state_indices`` while recurrence math keeps
+            the canonical ``[K, V]`` layout. This inference-only mode updates
+            the pool in place without a gather/scatter workspace.
+
+    Returns:
+        o (torch.Tensor):
+            Outputs of shape `[B, T, HV, V]`.
+        final_state (torch.Tensor):
+            Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
+
+    Examples::
+        >>> import torch
+        >>> import torch.nn.functional as F
+        >>> from einops import rearrange
+        >>> from fla.ops.kda import fused_recurrent_kda
+        # inputs with equal lengths
+        >>> B, T, H, HV, K, V = 4, 2048, 4, 8, 512, 512
+        >>> q = torch.randn(B, T, H, K, device='cuda')
+        >>> k = F.normalize(torch.randn(B, T, H, K, device='cuda'), p=2, dim=-1)
+        >>> v = torch.randn(B, T, HV, V, device='cuda')
+        >>> g = F.logsigmoid(torch.rand(B, T, HV, K, device='cuda'))
+        >>> beta = torch.rand(B, T, HV, device='cuda').sigmoid()
+        >>> h0 = torch.randn(B, HV, K, V, device='cuda')
+        >>> o, ht = fused_recurrent_kda(
+            q, k, v, g, beta,
+            initial_state=h0,
+            output_final_state=True
+        )
+        # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
+        >>> q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
+        # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
+        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
+        >>> o_var, ht_var = fused_recurrent_kda(
+            q, k, v, g, beta,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens
+        )
+    """
+
+    if "state_v_first" in kwargs:
+        if transpose_state_layout:
+            raise ValueError("Cannot pass both `transpose_state_layout` and its alias `state_v_first`.")
+        transpose_state_layout = kwargs.pop("state_v_first")
+    if vfirst_state_pool and transpose_state_layout:
+        raise ValueError(
+            "`vfirst_state_pool` preserves canonical recurrence layout and "
+            "cannot be combined with `transpose_state_layout`."
+        )
+
+    if q.ndim != 4:
+        raise ValueError(f"Expected `q` to be rank 4, got shape {q.shape}.")
+    B, T, H, K = q.shape
+    if k.shape != q.shape:
+        raise ValueError(f"Expected `k` to have shape {q.shape}, got {k.shape}.")
+    if v.ndim != 4 or v.shape[:2] != (B, T):
+        raise ValueError(f"Expected `v` to start with shape {(B, T)}, got {v.shape}.")
+    HV, V = v.shape[2:]
+    if H <= 0 or HV < H or HV % H != 0:
+        raise ValueError(f"Expected HV to be a positive multiple of H, got H={H}, HV={HV}.")
+    if g.shape != (B, T, HV, K):
+        raise ValueError(f"Expected `g` to have shape {(B, T, HV, K)}, got {g.shape}.")
+    if beta.shape not in ((B, T, HV), (B, T, HV, V)):
+        raise ValueError(
+            f"Expected `beta` to have shape {(B, T, HV)} or {(B, T, HV, V)}, got {beta.shape}."
+        )
+
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
+                f"Please flatten variable-length inputs before processing.",
+            )
+        if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("`cu_seqlens` must be a rank-1 int32 or int64 tensor.")
+        if (
+            initial_state is not None
+            and ssm_state_indices is None
+            and initial_state.shape[0] != len(cu_seqlens) - 1
+        ):
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
+            )
+        if ssm_state_indices is not None and ssm_state_indices.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError(
+                f"The leading dimension of `ssm_state_indices` is expected to be equal to the number "
+                f"of input sequences, i.e., {len(cu_seqlens) - 1} rather than {ssm_state_indices.shape[0]}.",
+            )
+    if inplace_final_state and initial_state is None:
+        raise ValueError("`initial_state` must be provided when `inplace_final_state=True`.")
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    if vfirst_state_pool:
+        if initial_state is None or ssm_state_indices is None:
+            raise ValueError(
+                "`vfirst_state_pool=True` requires `initial_state` and "
+                "`ssm_state_indices`."
+            )
+        if not inplace_final_state:
+            raise ValueError(
+                "`vfirst_state_pool=True` requires `inplace_final_state=True`."
+            )
+        expected_tail = (HV, V, K)
+        if initial_state.ndim != 4 or tuple(initial_state.shape[1:]) != expected_tail:
+            raise ValueError(
+                "Expected V-first state pool tail "
+                f"{expected_tail}, got {tuple(initial_state.shape)}."
+            )
+        if initial_state.dtype != torch.float32 or not initial_state.is_contiguous():
+            raise ValueError(
+                "V-first KDA state pool must be contiguous torch.float32."
+            )
+    if initial_state is not None and ssm_state_indices is None:
+        expected_state_shape = (N, HV, V, K) if transpose_state_layout else (N, HV, K, V)
+        if initial_state.shape != expected_state_shape:
+            raise ValueError(
+                f"Expected `initial_state` to have shape {expected_state_shape}, got {initial_state.shape}."
+            )
+    if use_gate_in_kernel:
+        if A_log is None or A_log.numel() != H:
+            raise ValueError(f"Raw gate activation requires `A_log` with {H} elements.")
+        if dt_bias is not None and dt_bias.numel() != H * K:
+            raise ValueError(f"Expected `dt_bias` to have {H * K} elements, got {dt_bias.numel()}.")
+    if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
+        raise ValueError("`allow_neg_eigval=True` requires `use_beta_sigmoid_in_kernel=True`.")
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+
+    differentiable_tensors = (q, k, v, g, beta, A_log, dt_bias, initial_state)
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in differentiable_tensors
+    )
+    if needs_backward:
+        if vfirst_state_pool:
+            raise ValueError("`vfirst_state_pool` is only supported without autograd.")
+        if K > 256:
+            raise ValueError(f"Fused recurrent KDA backward supports K <= 256, got K={K}.")
+        if inplace_final_state:
+            raise ValueError("`inplace_final_state=True` is only supported by the inference/decode path.")
+        if ssm_state_indices is not None or num_accepted_tokens is not None:
+            raise ValueError("Continuous batching and speculative decoding are only supported without autograd.")
+        if out is not None:
+            raise ValueError("A preallocated `out` tensor is only supported without autograd.")
+        return FusedRecurrentKDAFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            use_gate_in_kernel,
+            use_beta_sigmoid_in_kernel,
+            allow_neg_eigval,
+            lower_bound,
+            transpose_state_layout,
+            cu_seqlens,
+        )
+
+    return fused_recurrent_kda_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        inplace_final_state=inplace_final_state,
+        output_final_state=output_final_state,
+        ssm_state_indices=ssm_state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+        allow_neg_eigval=allow_neg_eigval,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        out=out,
+        transpose_state_layout=transpose_state_layout,
+        vfirst_state_pool=vfirst_state_pool,
+    )
